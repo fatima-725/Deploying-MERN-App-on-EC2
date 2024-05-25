@@ -1,0 +1,159 @@
+name: build mern image and push to docker hub
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+ # verbosity setting for Terraform logs
+ TF_LOG: INFO
+ # Credentials for deployment to AWS
+ AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+ AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+ 
+
+jobs:
+ build-images:
+    runs-on: ubuntu-latest
+    outputs:
+      client: ${{ steps.client.outputs.client_var }}
+      server: ${{ steps.server.outputs.server_var }}
+      nginx: ${{ steps.nginx.outputs.nginx_var }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 2
+      - id: client
+        run: |
+          client_var=$(git diff --name-only HEAD~1 HEAD | grep 'client' | wc -l)
+          echo "client_var=$client_var" >> $GITHUB_OUTPUT
+
+      - id: server
+        run: |
+          server_var=$(git diff --name-only HEAD~1 HEAD| grep 'server' | wc -l)
+          echo "server_var=$server_var" >> $GITHUB_OUTPUT
+
+      - id: nginx
+        run: |
+          nginx_var=$(git diff --name-only HEAD~1 HEAD | grep 'nginx' | wc -l)
+          echo "nginx_var=$nginx_var" >> $GITHUB_OUTPUT
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build and push proxy
+        if: steps.server.outputs.nginx_var != '0'
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/proxy:latest
+              
+      - name: Build and push frontend
+        if: steps.server.outputs.client_var != '0'
+        uses: docker/build-push-action@v4
+        with:
+          context: ./app/client
+          file: ./app/client/Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/frontend:latest
+
+
+      - name: Build and push server
+        if: steps.server.outputs.server_var != '0'
+        uses: docker/build-push-action@v4
+        with:
+          context: ./app/server
+          file: ./app/server/Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/server:latest
+  
+ terraform:
+   name: "Terraform Infrastructure Change Management"
+   runs-on: ubuntu-latest
+   needs: build-images
+   defaults:
+     run:
+       shell: bash
+       working-directory: ./terraform
+ 
+   steps:
+     - name: Checkout the repository to the runner
+       uses: actions/checkout@v2
+ 
+     - name: Setup Terraform with specified version on the runner
+       uses: hashicorp/setup-terraform@v2
+       with:
+         terraform_version: 1.4.6
+    
+     - name: Terraform init
+       id: init
+       run: terraform init -backend-config="access_key=${{ secrets.AWS_ACCESS_KEY_ID }}" -backend-config="secret_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+ 
+     - name: Terraform format
+       id: fmt
+       run: terraform fmt -check
+    
+     - name: Terraform validate
+       id: validate
+       run: terraform validate
+ 
+     - name: Terraform plan
+       id: plan
+       run: terraform plan -no-color -input=false
+    
+     - name: Terraform destroy
+       run: terraform destroy -auto-approve -input=false
+
+     - name: Save ASG name as artifact
+       id: asg_name
+       run: |
+         ASG_NAME=$(terraform output -raw asg_name)
+         echo $ASG_NAME
+       shell: bash
+
+     - run: echo ${{ steps.asg_name.outputs.stdout }} > asg_name.txt
+
+     - name: Upload ASG name artifact
+       uses: actions/upload-artifact@v3
+       with:
+         name: asg_name
+         path: asg_name.txt
+    
+ redeploy-asg:
+    needs: terraform
+    if: ${{ needs.build-images.outputs.client != '0' || needs.build-images.outputs.server != '0' || needs.build-images.outputs.nginx != '0' }}
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      AWS_ACCESS_KEY_ID : ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with: 
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Download ASG name artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: asg_name
+
+      - name: Refresh instances in ASG
+        shell: bash
+        run: |
+          # Retrieve the ASG name from the downloaded artifact
+          ASG_NAME=$(cat asg_name.txt)
+
+          # Instance Refresh
+          aws autoscaling start-instance-refresh --auto-scaling-group-name ${ASG_NAME} --preferences '{"InstanceWarmup": 400, "MinHealthyPercentage": 50}'
